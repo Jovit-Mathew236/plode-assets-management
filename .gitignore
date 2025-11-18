@@ -1,0 +1,11 @@
+.DS_Store
+
+#node modules
+node_modules/
+
+#lockfles
+package-lock.json
+bun.lock
+
+#environment variables
+.env

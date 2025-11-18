@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Firmware Management</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: {
+              50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe',
+              300: '#93c5fd', 400: '#60a5fa', 500: '#3b82f6',
+              600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a'
+            }
+          }
+        }
+      }
+    }
+  </script>
+</head>
+
+<body class="bg-gray-50">
+  <div id="app"></div>
+
+  <script type="module">
+    const CONFIG = {
+      GITHUB_TOKEN: localStorage.getItem('github_token') || '',
+      GITHUB_OWNER: 'Jovit-Mathew236',
+      GITHUB_REPO: 'plode-release-management',
+      GITHUB_BRANCH: 'main',
+      GITHUB_CLIENT_ID: 'Ov23liJJOak8gXXpOxCY',
+      // OAuth backend server URL
+      OAUTH_CALLBACK_URL: 'http://localhost:3000/api/auth'
+    };
+
+    // GitHub API Client
+    class GitHubAPI {
+      constructor(token) {
+        this.token = token;
+        this.baseURL = 'https://api.github.com';
+        this.owner = CONFIG.GITHUB_OWNER;
+        this.repo = CONFIG.GITHUB_REPO;
+        this.branch = CONFIG.GITHUB_BRANCH;
+      }
+
+      async request(endpoint, options = {}) {
+        const url = endpoint.startsWith('http') ? endpoint : `${this.baseURL}${endpoint}`;
+        const headers = {
+          'Accept': 'application/vnd.github.v3+json',
+          ...(this.token && { 'Authorization': `token ${this.token}` }),
+          ...options.headers
+        };
+
+        const response = await fetch(url, { ...options, headers });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({ message: 'Request failed' }));
+          throw new Error(error.message || 'GitHub API Error');
+        }
+        return response.json();
+      }
+
+      async listContents(path = '') {
+        return this.request(`/repos/${this.owner}/${this.repo}/contents/${path}?ref=${this.branch}`);
+      }
+
+      async getFile(path) {
+        const data = await this.request(`/repos/${this.owner}/${this.repo}/contents/${path}?ref=${this.branch}`);
+        if (data.type === 'file') {
+          return {
+            ...data,
+            decodedContent: atob(data.content.replace(/\n/g, ''))
+          };
+        }
+        return data;
+      }
+
+      async createOrUpdateFile(path, content, message, sha = null) {
+        return this.request(`/repos/${this.owner}/${this.repo}/contents/${path}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            message,
+            content: btoa(unescape(encodeURIComponent(content))),
+            branch: this.branch,
+            ...(sha && { sha })
+          })
+        });
+      }
+
+      async deleteFile(path, message, sha) {
+        return this.request(`/repos/${this.owner}/${this.repo}/contents/${path}`, {
+          method: 'DELETE',
+          body: JSON.stringify({ message, sha, branch: this.branch })
+        });
+      }
+
+      async deleteDirectory(path, message) {
+        // Recursively delete all files in a directory
+        const contents = await this.listContents(path);
+
+        // Delete files first
+        const files = contents.filter(item => item.type === 'file');
+        for (const file of files) {
+          await this.deleteFile(file.path, message, file.sha);
+        }
+
+        // Then recursively delete subdirectories
+        const dirs = contents.filter(item => item.type === 'dir');
+        for (const dir of dirs) {
+          await this.deleteDirectory(dir.path, message);
+        }
+      }
+
+      async getUser() {
+        return this.request('/user');
+      }
+
+      async checkRepoAccess() {
+        try {
+          await this.request(`/repos/${this.owner}/${this.repo}`);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    }
+
+    // OAuth Helper
+    async function exchangeCodeForToken(code) {
+      const response = await fetch(CONFIG.OAUTH_CALLBACK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to exchange code for token');
+      }
+
+      const data = await response.json();
+      return data.access_token;
+    }
+
+    // State Management
+    const state = {
+      user: null,
+      token: CONFIG.GITHUB_TOKEN,
+      currentPage: 'login',
+      firmware: [],
+      selectedFirmware: null,
+      currentPath: '',
+      currentFiles: [],
+      breadcrumbs: [],
+      loading: false,
+      error: null,
+      success: null
+    };
+
+    // Utility Functions
+    function formatFileSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function formatDate(dateString) {
+      return new Date(dateString).toLocaleString();
+    }
+
+    // Components
+    function Loading() {
+      return `<div class="flex justify-center items-center p-8">
+        <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
+      </div>`;
+    }
+
+    function Alert(message, type = 'error') {
+      const styles = {
+        error: 'bg-red-50 text-red-800 border-red-200',
+        success: 'bg-green-50 text-green-800 border-green-200',
+        info: 'bg-blue-50 text-blue-800 border-blue-200',
+        warning: 'bg-yellow-50 text-yellow-800 border-yellow-200'
+      };
+      return `<div class="border-l-4 p-4 mb-4 ${styles[type]} flex justify-between items-start">
+        <div>${message}</div>
+        <button onclick="state.${type === 'error' ? 'error' : 'success'} = null; app.render()" class="ml-4 text-current opacity-50 hover:opacity-100">
+          <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+            <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/>
+          </svg>
+        </button>
+      </div>`;
+    }
+
+    // Pages
+    function LoginPage() {
+      return `
+        <div class="min-h-screen flex items-center justify-center px-4">
+          <div class="bg-white p-8 rounded-lg shadow-md max-w-md w-full">
+            <h1 class="text-3xl font-bold text-center mb-8">Firmware Management</h1>
+
+            <div class="space-y-4">
+              <button
+                onclick="app.loginWithGitHub()"
+                class="w-full px-4 py-3 bg-gray-900 text-white rounded-md hover:bg-gray-800 font-medium flex items-center justify-center gap-2"
+              >
+                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                  <path fill-rule="evenodd" d="M10 0C4.477 0 0 4.484 0 10.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0110 4.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.942.359.31.678.921.678 1.856 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0020 10.017C20 4.484 15.522 0 10 0z" clip-rule="evenodd"/>
+                </svg>
+                Login with GitHub
+              </button>
+            </div>
+
+            ${state.error ? Alert(state.error) : ''}
+            ${state.success ? Alert(state.success, 'success') : ''}
+            ${state.loading ? Loading() : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    function Header() {
+      return `
+        <header class="bg-white shadow">
+          <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <button onclick="app.goToDashboard()" class="text-2xl font-bold text-gray-900 hover:text-primary-600">
+              Firmware Management
+            </button>
+            <div class="flex items-center gap-4">
+              <span class="text-sm text-gray-600">${state.user?.login || ''}</span>
+              <button onclick="app.logout()" class="px-4 py-2 bg-gray-200 text-gray-800 rounded-md hover:bg-gray-300">
+                Logout
+              </button>
+            </div>
+          </div>
+        </header>
+      `;
+    }
+
+    function Breadcrumbs() {
+      if (!state.breadcrumbs.length) return '';
+
+      return `
+        <nav class="flex mb-4" aria-label="Breadcrumb">
+          <ol class="inline-flex items-center space-x-1 md:space-x-3">
+            ${state.breadcrumbs.map((crumb, index) => `
+              <li class="inline-flex items-center">
+                ${index > 0 ? '<svg class="w-6 h-6 text-gray-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"></path></svg>' : ''}
+                <button
+                  onclick="app.navigateToPath('${crumb.path}')"
+                  class="inline-flex items-center text-sm font-medium ${index === state.breadcrumbs.length - 1 ? 'text-gray-700' : 'text-primary-600 hover:text-primary-700'}"
+                >
+                  ${crumb.name}
+                </button>
+              </li>
+            `).join('')}
+          </ol>
+        </nav>
+      `;
+    }
+
+    function DashboardPage() {
+      return `
+        <div class="min-h-screen">
+          ${Header()}
+          <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            <div class="flex justify-between items-center mb-6">
+              <h2 class="text-3xl font-bold">Firmware</h2>
+              <button onclick="app.showCreateModal()" class="px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700">
+                Create New Firmware
+              </button>
+            </div>
+
+            ${state.loading ? Loading() : ''}
+            ${state.error ? Alert(state.error, 'error') : ''}
+            ${state.success ? Alert(state.success, 'success') : ''}
+
+            ${state.firmware.length === 0 && !state.loading ? `
+              <div class="text-center py-12 bg-white rounded-lg">
+                <p class="text-gray-500 mb-4">No firmware found</p>
+                <button onclick="app.showCreateModal()" class="px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700">
+                  Create Your First Firmware
+                </button>
+              </div>
+            ` : `
+              <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                ${state.firmware.map(fw => `
+                  <button onclick="app.viewFirmware('${fw.name}')" class="text-left bg-white p-6 rounded-lg shadow hover:shadow-lg transition-shadow">
+                    <h3 class="text-xl font-semibold mb-2">${fw.name}</h3>
+                    ${fw.meta ? `
+                      <div class="text-sm text-gray-600 space-y-1">
+                        <p>Version: ${fw.meta.version || 'N/A'}</p>
+                        <p>Updated: ${fw.meta.last_updated ? new Date(fw.meta.last_updated).toLocaleDateString() : 'N/A'}</p>
+                      </div>
+                    ` : '<p class="text-sm text-gray-500">No metadata</p>'}
+                  </button>
+                `).join('')}
+              </div>
+            `}
+          </main>
+        </div>
+        <div id="modal"></div>
+      `;
+    }
+
+    function FirmwarePage() {
+      const fw = state.selectedFirmware;
+      if (!fw) return '';
+
+      return `
+        <div class="min-h-screen">
+          ${Header()}
+          <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            <button onclick="app.goToDashboard()" class="text-primary-600 hover:underline mb-4 inline-flex items-center">
+              <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+              </svg>
+              Back to Dashboard
+            </button>
+
+            <div class="flex justify-between items-center mb-4">
+              <h2 class="text-3xl font-bold">${fw.name}</h2>
+              <button
+                onclick="app.deleteFirmware('${fw.name}')"
+                class="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 inline-flex items-center gap-2"
+                title="Delete entire firmware directory"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                </svg>
+                Delete Firmware
+              </button>
+            </div>
+            ${Breadcrumbs()}
+
+            ${fw.meta ? `
+              <div class="bg-white p-4 rounded-lg mb-6">
+                <h3 class="font-semibold mb-2">Metadata</h3>
+                <dl class="grid grid-cols-2 gap-2 text-sm">
+                  <dt class="text-gray-600">Version:</dt><dd>${fw.meta.version}</dd>
+                  <dt class="text-gray-600">Last Updated:</dt><dd>${formatDate(fw.meta.last_updated)}</dd>
+                  ${fw.meta.zip_file ? `<dt class="text-gray-600">ZIP File:</dt><dd>${fw.meta.zip_file}</dd>` : ''}
+                  ${fw.meta.gcs_url ? `<dt class="text-gray-600">GCS URL:</dt><dd class="truncate text-xs">${fw.meta.gcs_url}</dd>` : ''}
+                </dl>
+              </div>
+            ` : ''}
+
+            <div class="bg-white p-6 rounded-lg mb-6">
+              <h3 class="text-xl font-semibold mb-4">Upload Files</h3>
+              <div class="flex gap-4 items-end">
+                <input
+                  type="file"
+                  id="fileInput"
+                  multiple
+                  class="block flex-1 text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-primary-50 file:text-primary-700 hover:file:bg-primary-100"
+                />
+                <button onclick="app.uploadFiles()" class="px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700 whitespace-nowrap">
+                  Upload
+                </button>
+              </div>
+            </div>
+
+            ${state.loading ? Loading() : ''}
+            ${state.error ? Alert(state.error, 'error') : ''}
+            ${state.success ? Alert(state.success, 'success') : ''}
+
+            <div class="bg-white rounded-lg shadow">
+              <div class="px-6 py-4 border-b">
+                <h3 class="text-xl font-semibold">Files</h3>
+              </div>
+              <div class="divide-y">
+                ${state.currentFiles.length === 0 ? `
+                  <p class="px-6 py-8 text-center text-gray-500">No files in this directory</p>
+                ` : state.currentFiles.map(file => `
+                  <div class="px-6 py-4 flex justify-between items-center hover:bg-gray-50">
+                    <div class="flex items-center gap-3 flex-1">
+                      ${file.type === 'dir' ? `
+                        <svg class="w-5 h-5 text-gray-400" fill="currentColor" viewBox="0 0 20 20">
+                          <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"></path>
+                        </svg>
+                      ` : `
+                        <svg class="w-5 h-5 text-gray-400" fill="currentColor" viewBox="0 0 20 20">
+                          <path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clip-rule="evenodd"></path>
+                        </svg>
+                      `}
+                      <div class="flex-1">
+                        <button
+                          onclick="app.${file.type === 'dir' ? `navigateIntoDir('${file.path}')` : `viewFile('${file.path}')`}"
+                          class="font-medium text-primary-600 hover:text-primary-700 text-left"
+                        >
+                          ${file.name}
+                        </button>
+                        ${file.type === 'file' ? `<p class="text-sm text-gray-500">${formatFileSize(file.size)}</p>` : ''}
+                      </div>
+                    </div>
+                    ${file.type === 'file' && file.name !== 'meta.yaml' ? `
+                      <button
+                        onclick="app.deleteFile('${file.path}', '${file.name}')"
+                        class="text-red-600 hover:text-red-800 text-sm ml-4"
+                      >
+                        Delete
+                      </button>
+                    ` : file.type === 'dir' ? `
+                      <button
+                        onclick="app.deleteDirectory('${file.path}', '${file.name}')"
+                        class="text-red-600 hover:text-red-800 text-sm ml-4 inline-flex items-center gap-1"
+                        title="Delete entire directory"
+                      >
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                        </svg>
+                        Delete
+                      </button>
+                    ` : ''}
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          </main>
+        </div>
+        <div id="modal"></div>
+      `;
+    }
+
+    // Application Logic
+    const app = {
+      async init() {
+        // Check for OAuth callback
+        const urlParams = new URLSearchParams(window.location.search);
+        const code = urlParams.get('code');
+
+        if (code) {
+          await this.handleOAuthCallback(code);
+          return;
+        }
+
+        if (state.token) {
+          await this.checkAuth();
+        } else {
+          this.render();
+        }
+      },
+
+      loginWithGitHub() {
+        const redirectUri = window.location.origin + window.location.pathname;
+        const scope = 'repo';
+        window.location.href = `https://github.com/login/oauth/authorize?client_id=${CONFIG.GITHUB_CLIENT_ID}&redirect_uri=${redirectUri}&scope=${scope}`;
+      },
+
+      async handleOAuthCallback(code) {
+        try {
+          state.loading = true;
+          this.render();
+
+          // Clean URL
+          window.history.replaceState({}, document.title, window.location.pathname);
+
+          // Exchange code for token
+          const token = await exchangeCodeForToken(code);
+          state.token = token;
+          localStorage.setItem('github_token', token);
+          CONFIG.GITHUB_TOKEN = token;
+
+          await this.checkAuth();
+        } catch (error) {
+          state.error = error.message;
+          state.loading = false;
+          state.currentPage = 'login';
+          this.render();
+        }
+      },
+
+      async loginWithToken() {
+        const token = document.getElementById('tokenInput')?.value.trim();
+        if (!token) {
+          state.error = 'Please enter a GitHub token';
+          this.render();
+          return;
+        }
+
+        state.token = token;
+        state.error = null;
+        localStorage.setItem('github_token', token);
+        CONFIG.GITHUB_TOKEN = token;
+        await this.checkAuth();
+      },
+
+      async checkAuth() {
+        try {
+          state.loading = true;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          state.user = await api.getUser();
+          const hasAccess = await api.checkRepoAccess();
+
+          if (!hasAccess) {
+            throw new Error('No access to repository. Please check repository name and token permissions.');
+          }
+
+          state.currentPage = 'dashboard';
+          await this.loadFirmware();
+        } catch (error) {
+          state.error = error.message;
+          state.token = '';
+          localStorage.removeItem('github_token');
+          state.currentPage = 'login';
+        } finally {
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      logout() {
+        state.token = '';
+        state.user = null;
+        state.currentPage = 'login';
+        state.firmware = [];
+        state.selectedFirmware = null;
+        localStorage.removeItem('github_token');
+        this.render();
+      },
+
+      async loadFirmware() {
+        try {
+          state.loading = true;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          const contents = await api.listContents();
+
+          const folders = contents.filter(item =>
+            item.type === 'dir' &&
+            !item.name.startsWith('.') &&
+            item.name !== 'webapp' &&
+            item.name !== 'docs'
+          );
+
+          state.firmware = await Promise.all(
+            folders.map(async folder => {
+              try {
+                const metaFile = await api.getFile(`${folder.name}/meta.yaml`);
+                const meta = this.parseYAML(metaFile.decodedContent);
+                return { ...folder, meta };
+              } catch {
+                return { ...folder, meta: null };
+              }
+            })
+          );
+        } catch (error) {
+          state.error = error.message;
+        } finally {
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      async viewFirmware(name) {
+        try {
+          state.loading = true;
+          state.error = null;
+          state.success = null;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+
+          let meta = null;
+          try {
+            const metaFile = await api.getFile(`${name}/meta.yaml`);
+            meta = this.parseYAML(metaFile.decodedContent);
+          } catch (e) {
+            console.log('No meta.yaml found');
+          }
+
+          const files = await api.listContents(name);
+
+          state.selectedFirmware = { name, meta };
+          state.currentPath = name;
+          state.currentFiles = files;
+          state.breadcrumbs = [{ name: name, path: name }];
+          state.currentPage = 'firmware';
+        } catch (error) {
+          state.error = error.message;
+        } finally {
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      async navigateIntoDir(path) {
+        try {
+          state.loading = true;
+          state.error = null;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          const files = await api.listContents(path);
+
+          state.currentPath = path;
+          state.currentFiles = files;
+
+          const parts = path.split('/');
+          state.breadcrumbs = parts.map((part, index) => ({
+            name: part,
+            path: parts.slice(0, index + 1).join('/')
+          }));
+
+        } catch (error) {
+          state.error = error.message;
+        } finally {
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      async navigateToPath(path) {
+        if (path === state.selectedFirmware.name) {
+          await this.viewFirmware(path);
+        } else {
+          await this.navigateIntoDir(path);
+        }
+      },
+
+      goToDashboard() {
+        state.currentPage = 'dashboard';
+        state.selectedFirmware = null;
+        state.currentPath = '';
+        state.currentFiles = [];
+        state.breadcrumbs = [];
+        state.error = null;
+        state.success = null;
+        this.render();
+      },
+
+      async uploadFiles() {
+        const fileInput = document.getElementById('fileInput');
+        const files = fileInput?.files;
+
+        if (!files || files.length === 0) {
+          state.error = 'Please select files to upload';
+          this.render();
+          return;
+        }
+
+        try {
+          state.loading = true;
+          state.error = null;
+          state.success = null;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          const uploadPath = state.currentPath;
+
+          for (const file of files) {
+            const reader = new FileReader();
+            await new Promise((resolve, reject) => {
+              reader.onload = async (e) => {
+                try {
+                  const content = e.target.result;
+                  const filePath = `${uploadPath}/${file.name}`;
+
+                  let sha = null;
+                  try {
+                    const existing = await api.getFile(filePath);
+                    sha = existing.sha;
+                  } catch { }
+
+                  await api.createOrUpdateFile(filePath, content, `Upload ${file.name}`, sha);
+                  resolve();
+                } catch (error) {
+                  reject(error);
+                }
+              };
+              reader.onerror = reject;
+              reader.readAsText(file);
+            });
+          }
+
+          fileInput.value = '';
+          state.success = `Successfully uploaded ${files.length} file(s)`;
+          await this.navigateToPath(state.currentPath);
+        } catch (error) {
+          state.error = error.message;
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      async deleteFile(path, name) {
+        if (!confirm(`Are you sure you want to delete ${name}?`)) return;
+
+        try {
+          state.loading = true;
+          state.error = null;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          const file = await api.getFile(path);
+          await api.deleteFile(path, `Delete ${name}`, file.sha);
+
+          state.success = `Successfully deleted ${name}`;
+          await this.navigateToPath(state.currentPath);
+        } catch (error) {
+          state.error = error.message;
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      async deleteFirmware(firmwareName) {
+        const message = `Are you sure you want to delete the entire firmware "${firmwareName}"?\n\nThis will delete:\n- All files and subdirectories\n- meta.yaml\n- ZIP files\n- All other content\n\nThis action cannot be undone!`;
+
+        if (!confirm(message)) return;
+
+        // Double confirmation for safety
+        const confirmText = prompt(`Type "${firmwareName}" to confirm deletion:`);
+        if (confirmText !== firmwareName) {
+          state.error = 'Deletion cancelled - name did not match';
+          this.render();
+          return;
+        }
+
+        try {
+          state.loading = true;
+          state.error = null;
+          state.success = null;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          await api.deleteDirectory(firmwareName, `Delete firmware: ${firmwareName}`);
+
+          state.success = `Successfully deleted firmware: ${firmwareName}`;
+          state.selectedFirmware = null;
+          state.currentPage = 'dashboard';
+          await this.loadFirmware();
+        } catch (error) {
+          state.error = `Failed to delete firmware: ${error.message}`;
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      async deleteDirectory(dirPath, dirName) {
+        const message = `Are you sure you want to delete the directory "${dirName}" and all its contents?\n\nThis action cannot be undone!`;
+
+        if (!confirm(message)) return;
+
+        try {
+          state.loading = true;
+          state.error = null;
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          await api.deleteDirectory(dirPath, `Delete directory: ${dirName}`);
+
+          state.success = `Successfully deleted directory: ${dirName}`;
+          await this.navigateToPath(state.currentPath);
+        } catch (error) {
+          state.error = `Failed to delete directory: ${error.message}`;
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      viewFile(path) {
+        const modal = document.getElementById('modal');
+        state.loading = true;
+        this.render();
+
+        const api = new GitHubAPI(state.token);
+        api.getFile(path).then(file => {
+          state.loading = false;
+          const fileName = path.split('/').pop();
+          modal.innerHTML = `
+            <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50" onclick="if(event.target === this) document.getElementById('modal').innerHTML = ''">
+              <div class="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] flex flex-col">
+                <div class="px-6 py-4 border-b flex justify-between items-center">
+                  <h3 class="text-xl font-semibold">${fileName}</h3>
+                  <button onclick="document.getElementById('modal').innerHTML = ''" class="text-gray-500 hover:text-gray-700">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                  </button>
+                </div>
+                <div class="p-6 overflow-auto flex-1">
+                  <pre class="text-sm bg-gray-50 p-4 rounded overflow-x-auto"><code>${this.escapeHtml(file.decodedContent)}</code></pre>
+                </div>
+                <div class="px-6 py-4 border-t bg-gray-50">
+                  <p class="text-sm text-gray-600">Size: ${formatFileSize(file.size)}</p>
+                </div>
+              </div>
+            </div>
+          `;
+        }).catch(error => {
+          state.loading = false;
+          state.error = error.message;
+          this.render();
+        });
+      },
+
+      showCreateModal() {
+        const modal = document.getElementById('modal');
+        modal.innerHTML = `
+          <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+            <div class="bg-white rounded-lg max-w-md w-full p-6">
+              <h2 class="text-xl font-semibold mb-4">Create New Firmware</h2>
+              <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1">Firmware Name</label>
+                <input
+                  id="firmwareName"
+                  type="text"
+                  placeholder="esp32-controller"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500"
+                  onkeypress="if(event.key === 'Enter') app.createFirmware()"
+                />
+                <p class="mt-1 text-xs text-gray-500">Use only letters, numbers, hyphens, and underscores</p>
+              </div>
+              <div class="flex gap-2">
+                <button onclick="app.createFirmware()" class="flex-1 px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700">
+                  Create
+                </button>
+                <button onclick="document.getElementById('modal').innerHTML = ''" class="flex-1 px-4 py-2 bg-gray-200 text-gray-800 rounded-md hover:bg-gray-300">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+        setTimeout(() => document.getElementById('firmwareName')?.focus(), 100);
+      },
+
+      async createFirmware() {
+        const name = document.getElementById('firmwareName')?.value.trim();
+        if (!name || !/^[a-zA-Z0-9-_]+$/.test(name)) {
+          alert('Invalid name. Use only letters, numbers, hyphens, and underscores.');
+          return;
+        }
+
+        try {
+          state.loading = true;
+          document.getElementById('modal').innerHTML = '';
+          this.render();
+
+          const api = new GitHubAPI(state.token);
+          const readme = `# ${name}\n\nFirmware description`;
+          await api.createOrUpdateFile(`${name}/README.md`, readme, `Create ${name} firmware`);
+
+          state.success = `Created firmware: ${name}`;
+          await this.loadFirmware();
+        } catch (error) {
+          state.error = error.message;
+          state.loading = false;
+          this.render();
+        }
+      },
+
+      parseYAML(content) {
+        try {
+          const lines = content.split('\n');
+          const result = {};
+          lines.forEach(line => {
+            const match = line.match(/^(\w+):\s*(.+)$/);
+            if (match) {
+              const [, key, value] = match;
+              result[key] = value.replace(/['"]/g, '').trim();
+            }
+          });
+          return result;
+        } catch {
+          return null;
+        }
+      },
+
+      escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      },
+
+      render() {
+        const pages = {
+          login: LoginPage,
+          dashboard: DashboardPage,
+          firmware: FirmwarePage
+        };
+
+        document.getElementById('app').innerHTML = pages[state.currentPage]();
+      }
+    };
+
+    window.app = app;
+    app.init();
+  </script>
+</body>
+
+</html>
