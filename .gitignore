@@ -12,3 +12,6 @@ bun.lock
 
 # build output
 dist/
+
+# vscode settings
+.vscode/
