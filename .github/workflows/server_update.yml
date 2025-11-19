@@ -42,6 +42,5 @@ jobs:
           ssh -i server_key.pem -o StrictHostKeyChecking=no \
             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
             "
-              source ~/.nvm/nvm.sh;
               sudo pm2 restart plode_assets_management;
             "
