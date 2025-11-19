@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 3000;
 const GITHUB_APP_CLIENT_ID = process.env.GITHUB_APP_CLIENT_ID;
 const GITHUB_APP_CLIENT_SECRET = process.env.GITHUB_APP_CLIENT_SECRET;
 const APP_CALLBACK_URL = process.env.APP_CALLBACK_URL;
+const GITHUB_ADMIN_PAT = process.env.GITHUB_ADMIN_PAT;
 
 // Repository configuration for access control
 const GITHUB_OWNER = process.env.GITHUB_OWNER || 'Jovit-Mathew236';
@@ -26,45 +27,91 @@ if (!GITHUB_APP_CLIENT_ID || !GITHUB_APP_CLIENT_SECRET) {
   process.exit(1);
 }
 
+if (!GITHUB_ADMIN_PAT) {
+  console.error("ERROR: Missing GITHUB_ADMIN_PAT environment variable!");
+  console.error(
+    "Please set GITHUB_ADMIN_PAT in .env file - this is your Personal Access Token for repo operations"
+  );
+  process.exit(1);
+}
+
 if (ACCESS_CONTROL_TYPE === 'organization' && !GITHUB_ORGANIZATION) {
   console.error("ERROR: GITHUB_ORGANIZATION is required when ACCESS_CONTROL_TYPE=organization");
   process.exit(1);
 }
 
-// Helper function to check if user is a collaborator
+// Helper function to check if user is a collaborator with write access
 async function isCollaborator(username, token) {
-  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/collaborators/${username}`;
+  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/collaborators/${username}/permission`;
 
   try {
     const response = await fetch(url, {
       headers: {
-        "Authorization": `token ${token}`,
+        "Authorization": `token ${GITHUB_ADMIN_PAT}`,
         "Accept": "application/vnd.github+json"
       }
     });
 
-    // 204 = is a collaborator, 404 = not a collaborator
-    return response.status === 204;
+    if (!response.ok) {
+      console.error(`Error checking collaborator status: ${response.status}`);
+      return false;
+    }
+
+    const data = await response.json();
+
+    // Check if user has write, maintain, or admin permissions
+    // Permissions: read, triage, write, maintain, admin
+    const writePermissions = ['write', 'maintain', 'admin'];
+    const hasWriteAccess = writePermissions.includes(data.permission);
+
+    console.log(`User ${username} has permission: ${data.permission}, write access: ${hasWriteAccess}`);
+
+    return hasWriteAccess;
   } catch (error) {
     console.error("Error checking collaborator status:", error);
     return false;
   }
 }
 
-// Helper function to check if user is an organization member
+// Helper function to check if user is an organization member with repo access
 async function isOrganizationMember(username, token) {
-  const url = `https://api.github.com/orgs/${GITHUB_ORGANIZATION}/members/${username}`;
+  const memberUrl = `https://api.github.com/orgs/${GITHUB_ORGANIZATION}/members/${username}`;
 
   try {
-    const response = await fetch(url, {
+    // First check if user is a member of the organization
+    const memberResponse = await fetch(memberUrl, {
       headers: {
-        "Authorization": `token ${token}`,
+        "Authorization": `token ${GITHUB_ADMIN_PAT}`,
         "Accept": "application/vnd.github+json"
       }
     });
 
-    // 204 = is a member, 404 = not a member
-    return response.status === 204;
+    if (memberResponse.status !== 204) {
+      console.log(`User ${username} is not a member of organization ${GITHUB_ORGANIZATION}`);
+      return false;
+    }
+
+    // Then check if they have write access to the specific repo
+    const permissionUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/collaborators/${username}/permission`;
+    const permResponse = await fetch(permissionUrl, {
+      headers: {
+        "Authorization": `token ${GITHUB_ADMIN_PAT}`,
+        "Accept": "application/vnd.github+json"
+      }
+    });
+
+    if (!permResponse.ok) {
+      console.log(`User ${username} is an org member but has no access to repo ${GITHUB_OWNER}/${GITHUB_REPO}`);
+      return false;
+    }
+
+    const data = await permResponse.json();
+    const writePermissions = ['write', 'maintain', 'admin'];
+    const hasWriteAccess = writePermissions.includes(data.permission);
+
+    console.log(`User ${username} (org member) has permission: ${data.permission}, write access: ${hasWriteAccess}`);
+
+    return hasWriteAccess;
   } catch (error) {
     console.error("Error checking organization membership:", error);
     return false;
@@ -180,11 +227,11 @@ const server = http.createServer(async (req, res) => {
             ? `organization ${GITHUB_ORGANIZATION}`
             : `repository ${GITHUB_OWNER}/${GITHUB_REPO}`;
 
-          console.log(`Access denied for user: ${user.login} - Not a ${accessType}`);
+          console.log(`Access denied for user: ${user.login} - Not a ${accessType} with write access`);
           res.writeHead(403, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             error: "Access Denied",
-            message: `You must be a ${accessType} of ${accessScope} to use this application.`
+            message: `You must be a ${accessType} with write access (or owner) to ${accessScope} to use this application. Please contact the repository owner to request access.`
           }));
           return;
         }
@@ -193,10 +240,12 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           access_token: data.access_token,
+          admin_token: GITHUB_ADMIN_PAT,
           user: {
             login: user.login,
             avatar_url: user.avatar_url,
-            name: user.name
+            name: user.name,
+            email: user.email
           }
         }));
       } catch (error) {

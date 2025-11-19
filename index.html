@@ -68,7 +68,7 @@
       GITHUB_BRANCH: 'main',
 
       // GitHub App Client ID
-      GITHUB_APP_CLIENT_ID: 'Iv23li4HwUVWfz52SZ0p',
+      GITHUB_APP_CLIENT_ID: 'Ov23liJJOak8gXXpOxCY',
 
       // App URLs
       APP_HOMEPAGE_URL: 'https://pipeline.plode.org/plode-assets-management/',
@@ -98,8 +98,9 @@
 
     // GitHub API Client
     class GitHubAPI {
-      constructor(token) {
+      constructor(token, author = null) {
         this.token = token;
+        this.author = author; // { name, email } for commit attribution
         this.baseURL = 'https://api.github.com';
         this.owner = CONFIG.GITHUB_OWNER;
         this.repo = CONFIG.GITHUB_REPO;
@@ -138,23 +139,53 @@
       }
 
       async createOrUpdateFile(path, content, message, sha = null) {
+        const requestBody = {
+          message,
+          content: btoa(unescape(encodeURIComponent(content))),
+          branch: this.branch,
+          ...(sha && { sha }),
+          // Set commit author if provided
+          ...(this.author && this.author.name && this.author.email && {
+            author: {
+              name: this.author.name,
+              email: this.author.email
+            },
+            committer: {
+              name: this.author.name,
+              email: this.author.email
+            }
+          })
+        };
+
         const response = await this.request(`/repos/${this.owner}/${this.repo}/contents/${path}`, {
           method: 'PUT',
-          body: JSON.stringify({
-            message,
-            content: btoa(unescape(encodeURIComponent(content))),
-            branch: this.branch,
-            ...(sha && { sha })
-          })
+          body: JSON.stringify(requestBody)
         });
         // Return the full response including commit SHA
         return response;
       }
 
       async deleteFile(path, message, sha) {
+        const requestBody = {
+          message,
+          sha,
+          branch: this.branch,
+          // Set commit author if provided
+          ...(this.author && this.author.name && this.author.email && {
+            author: {
+              name: this.author.name,
+              email: this.author.email
+            },
+            committer: {
+              name: this.author.name,
+              email: this.author.email
+            }
+          })
+        };
+
         const response = await this.request(`/repos/${this.owner}/${this.repo}/contents/${path}`, {
           method: 'DELETE',
-          body: JSON.stringify({ message, sha, branch: this.branch })
+          body: JSON.stringify(requestBody)
         });
         // Return the full response including commit SHA
         return response;
@@ -265,17 +296,19 @@
       });
 
       if (!response.ok) {
-        throw new Error('Failed to exchange code for token');
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.message || errorData.error || 'Failed to exchange code for token');
       }
 
       const data = await response.json();
-      return data.access_token;
+      return data;
     }
 
     // State Management
     const state = {
       user: null,
-      token: CONFIG.GITHUB_TOKEN,
+      token: CONFIG.GITHUB_TOKEN, // Admin PAT for repo operations
+      userToken: null, // User OAuth token (not used for repo ops)
       currentPage: 'login',
       firmware: [],
       selectedFirmware: null,
@@ -298,6 +331,17 @@
 
     function formatDate(dateString) {
       return new Date(dateString).toLocaleString();
+    }
+
+    // Helper to get author info for commits
+    function getAuthorInfo() {
+      if (state.user && state.user.name && state.user.email) {
+        return {
+          name: state.user.name || state.user.login,
+          email: state.user.email
+        };
+      }
+      return null;
     }
 
     // Toast Notification System
@@ -667,6 +711,16 @@
         // Load firmware structure first
         await loadFirmwareStructure();
 
+        // Load stored user info if available
+        const storedUser = localStorage.getItem('github_user');
+        if (storedUser) {
+          try {
+            state.user = JSON.parse(storedUser);
+          } catch (e) {
+            console.error('Failed to parse stored user info');
+          }
+        }
+
         // Check for OAuth callback
         const urlParams = new URLSearchParams(window.location.search);
         const code = urlParams.get('code');
@@ -686,8 +740,9 @@
       loginWithGitHub() {
         // GitHub App web application flow
         const redirectUri = CONFIG.APP_HOMEPAGE_URL;
+        const scope = 'read:user%20user:email'
         window.location.href =
-          `https://github.com/login/oauth/authorize?client_id=${CONFIG.GITHUB_APP_CLIENT_ID}&redirect_uri=${redirectUri}`;
+          `https://github.com/login/oauth/authorize?client_id=${CONFIG.GITHUB_APP_CLIENT_ID}&redirect_uri=${redirectUri}&scope=${scope}`;
       },
 
       async handleOAuthCallback(code) {
@@ -698,11 +753,20 @@
           // Clean URL
           window.history.replaceState({}, document.title, window.location.pathname);
 
-          // Exchange code for token
-          const token = await exchangeCodeForToken(code);
-          state.token = token;
-          localStorage.setItem('github_token', token);
-          CONFIG.GITHUB_TOKEN = token;
+          // Exchange code for tokens and user info
+          const authData = await exchangeCodeForToken(code);
+
+          // Store user OAuth token (for identity only)
+          state.userToken = authData.access_token;
+
+          // Store admin PAT (for repo operations)
+          state.token = authData.admin_token;
+          localStorage.setItem('github_token', authData.admin_token);
+          CONFIG.GITHUB_TOKEN = authData.admin_token;
+
+          // Store user info with email
+          state.user = authData.user;
+          localStorage.setItem('github_user', JSON.stringify(authData.user));
 
           await this.checkAuth();
         } catch (error) {
@@ -733,8 +797,11 @@
           state.loading = true;
           this.render();
 
-          const api = new GitHubAPI(state.token);
-          state.user = await api.getUser();
+          const api = new GitHubAPI(state.token, getAuthorInfo());
+          // Only fetch user info if we don't already have it (from OAuth)
+          if (!state.user) {
+            state.user = await api.getUser();
+          }
           const hasAccess = await api.checkRepoAccess();
 
           if (!hasAccess) {
@@ -756,11 +823,13 @@
 
       logout() {
         state.token = '';
+        state.userToken = null;
         state.user = null;
         state.currentPage = 'login';
         state.firmware = [];
         state.selectedFirmware = null;
         localStorage.removeItem('github_token');
+        localStorage.removeItem('github_user');
         this.render();
       },
 
@@ -769,7 +838,7 @@
           state.loading = true;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const contents = await api.listContents();
 
           const folders = contents.filter(item =>
@@ -805,7 +874,7 @@
           state.success = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
 
           let meta = null;
           try {
@@ -838,7 +907,7 @@
           state.error = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const files = await api.listContents(path);
 
           state.currentPath = path;
@@ -894,7 +963,7 @@
           state.loading = true;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const firmwareName = state.selectedFirmware.name;
           const fullPath = `${firmwareName}/${path}`;
 
@@ -935,7 +1004,7 @@
           state.success = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const firmwareName = state.selectedFirmware.name;
           const uploadPath = `${firmwareName}/${state.selectedUploadPath}`;
 
@@ -1049,7 +1118,7 @@
           state.success = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const uploadPath = state.currentPath;
 
           for (const file of files) {
@@ -1106,7 +1175,7 @@
           state.error = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const file = await api.getFile(path);
           const deleteResult = await api.deleteFile(path, `Delete ${name}`, file.sha);
 
@@ -1189,7 +1258,7 @@
           state.success = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           await api.deleteDirectory(firmwareName, `Delete firmware: ${firmwareName}`);
 
           state.success = `Successfully deleted firmware: ${firmwareName}`;
@@ -1213,7 +1282,7 @@
           state.error = null;
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           await api.deleteDirectory(dirPath, `Delete directory: ${dirName}`);
 
           state.success = `Successfully deleted directory: ${dirName}`;
@@ -1230,7 +1299,7 @@
         state.loading = true;
         this.render();
 
-        const api = new GitHubAPI(state.token);
+        const api = new GitHubAPI(state.token, getAuthorInfo());
         api.getFile(path).then(file => {
           state.loading = false;
           const fileName = path.split('/').pop();
@@ -1304,7 +1373,7 @@
           document.getElementById('modal').innerHTML = '';
           this.render();
 
-          const api = new GitHubAPI(state.token);
+          const api = new GitHubAPI(state.token, getAuthorInfo());
           const readme = `# ${name}\n\nFirmware description`;
           await api.createOrUpdateFile(`${name}/README.md`, readme, `Create ${name} firmware`);
 
