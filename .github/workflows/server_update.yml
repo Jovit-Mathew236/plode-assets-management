@@ -30,11 +30,7 @@ jobs:
       - name: Upload files to EC2
         run: |
           scp -i server_key.pem -o StrictHostKeyChecking=no \
-            -r dist/* \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.FILE_TARGET }}
-
-          scp -i server_key.pem -o StrictHostKeyChecking=no \
-            index.html firmware-structure.json \
+            -r dist/* index.html firmware-structure.json \
             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.FILE_TARGET }}
 
       - name: Restart PM2 Service
