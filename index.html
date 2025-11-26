@@ -836,7 +836,8 @@
 
           await this.checkAuth();
         } catch (error) {
-          state.error = error.message;
+          state.error = "You have no access Please contact your lead";
+          console.log(error.message);
           state.loading = false;
           state.currentPage = 'login';
           this.render();
@@ -882,8 +883,7 @@
           state.currentPage = 'dashboard';
           await this.loadFirmware();
         } catch (error) {
-          state.error = "You have no access Please contact your lead";
-          console.log(error.message);
+          state.error = error.message;
           state.token = '';
           localStorage.removeItem('github_token');
           state.currentPage = 'login';
