@@ -836,7 +836,7 @@
 
           await this.checkAuth();
         } catch (error) {
-          state.error = "You have no access Please contact your lead";
+          state.error = "Permission Error";
           console.log(error.message);
           state.loading = false;
           state.currentPage = 'login';
