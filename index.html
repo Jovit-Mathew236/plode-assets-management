@@ -882,7 +882,8 @@
           state.currentPage = 'dashboard';
           await this.loadFirmware();
         } catch (error) {
-          state.error = error.message;
+          state.error = "You have no access Please contact your lead";
+          console.log(error.message);
           state.token = '';
           localStorage.removeItem('github_token');
           state.currentPage = 'login';
